@@ -26,3 +26,33 @@ add_library(goredis_persistence STATIC
 target_include_directories(goredis_persistence PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(goredis_persistence PUBLIC cxx_std_17)
 target_link_libraries(goredis_persistence PUBLIC goredis_store)
+
+# Stage 5 (networking): RESP2 protocol encode/decode, kept independent of
+# both Store and sockets — it only knows about bytes and strings, so it's
+# reusable (and independently testable) without pulling in either.
+add_library(goredis_resp STATIC
+  resp/resp_value.cpp
+  resp/command_parser.cpp
+)
+target_include_directories(goredis_resp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(goredis_resp PUBLIC cxx_std_17)
+
+# Stage 5 (networking): command dispatch (RESP <-> Store) and the raw
+# POSIX-socket TCP server, thread-per-connection.
+add_library(goredis_server STATIC
+  server/dispatcher.cpp
+  server/tcp_server.cpp
+)
+target_include_directories(goredis_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(goredis_server PUBLIC cxx_std_17)
+target_link_libraries(goredis_server PUBLIC goredis_store goredis_resp Threads::Threads)
+
+# The actual server executable, linking everything above together.
+# goredis_store isn't listed explicitly — both goredis_persistence and
+# goredis_server already PUBLIC-link it, so CMake pulls it in
+# transitively; listing it again here just produced a harmless but noisy
+# "ignoring duplicate libraries" linker warning.
+add_executable(goredis-server
+  main.cpp
+)
+target_link_libraries(goredis-server PRIVATE goredis_persistence goredis_server)
