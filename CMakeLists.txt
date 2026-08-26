@@ -29,3 +29,11 @@ if(GOREDIS_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# Stage 7: hand-rolled std::chrono benchmarks (no external dependency —
+# see benchmarks/bench_util.h for why). Optional and default-ON, same
+# reasoning as GOREDIS_BUILD_TESTS above.
+option(GOREDIS_BUILD_BENCHMARKS "Build the benchmark suite" ON)
+if(GOREDIS_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif()
