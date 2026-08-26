@@ -79,9 +79,24 @@ bool TcpServer::Start() {
     return false;
   }
 
+  // getsockname() reports the port actually bound — the only way to find
+  // out what the OS picked when port_ was 0 (see ListenPort()). Always
+  // done, not just when port_ == 0, so ListenPort() is uniformly correct
+  // either way rather than having a special case for "was a specific
+  // port requested."
+  sockaddr_in bound_addr{};
+  socklen_t bound_len = sizeof(bound_addr);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) == 0) {
+    actual_port_.store(ntohs(bound_addr.sin_port), std::memory_order_relaxed);
+  } else {
+    actual_port_.store(port_, std::memory_order_relaxed);  // shouldn't happen; a reasonable fallback if it does
+  }
+
   listen_fd_.store(fd, std::memory_order_relaxed);
   return true;
 }
+
+int TcpServer::ListenPort() const { return actual_port_.load(std::memory_order_relaxed); }
 
 void TcpServer::AcceptLoop() {
   while (!stop_flag_.load(std::memory_order_relaxed)) {
@@ -154,10 +169,26 @@ void TcpServer::Stop() {
 
   // Bounded wait for detached client threads to notice and finish, so a
   // caller of Stop() (main.cpp: taking a final RDB snapshot right after
-  // Stop() returns) doesn't race against a client thread still mid-
-  // command against the same Store.
+  // Stop() returns; this project's own tests: destroying the TcpServer
+  // right after Stop() returns) doesn't race against a client thread
+  // still mid-cleanup against the same Store or the same client_fds_
+  // vector Stop() already read above.
+  //
+  // memory_order_acquire, not relaxed: this load isn't just reading a
+  // counter, it's the other half of a completion signal from
+  // ClientGuard's release fetch_sub below. Relaxed would only guarantee
+  // the *integer value* 0 becomes visible eventually — it says nothing
+  // about whether everything the client thread did *before* decrementing
+  // (closing its fd, erasing itself from client_fds_ under clients_mu_)
+  // is visible to this thread once it observes that 0. An acquire load
+  // that reads a release store/RMW's result synchronizes-with it,
+  // making everything before the release visible after the acquire —
+  // exactly the guarantee "safe to now destroy/touch shared state"
+  // needs. (Caught by ThreadSanitizer as a real data race on
+  // client_fds_ during test teardown — this comment describes the fix
+  // for that, not a hypothetical concern.)
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (active_clients_.load(std::memory_order_relaxed) > 0 && std::chrono::steady_clock::now() < deadline) {
+  while (active_clients_.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
@@ -177,7 +208,11 @@ void TcpServer::HandleClient(int client_fd) {
         auto& fds = server->client_fds_;
         fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
       }
-      server->active_clients_.fetch_sub(1, std::memory_order_relaxed);
+      // release: pairs with the acquire load in Stop()'s drain-wait loop
+      // — see the comment there. Everything above this line (close(),
+      // the mutex-protected erase) must be visible to whatever thread
+      // later observes this decrement via an acquire load.
+      server->active_clients_.fetch_sub(1, std::memory_order_release);
     }
   } guard{this, client_fd};
 

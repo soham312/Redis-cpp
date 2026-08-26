@@ -24,6 +24,13 @@ namespace goredis {
 // actually need.
 class TcpServer {
  public:
+  // port == 0 asks the OS to assign any free ephemeral port instead of a
+  // specific one — the standard, collision-proof way to get an isolated
+  // server instance without hardcoding or coordinating port numbers
+  // (used by this project's own tests, which run as independent
+  // processes under ctest and can't coordinate a shared "next free port"
+  // counter with each other). See ListenPort() to find out which port
+  // was actually assigned.
   TcpServer(Store& store, int port);
 
   // Start creates, binds, and listens on the server's socket. Must
@@ -34,6 +41,12 @@ class TcpServer {
   // a bind failure immediately, rather than having to synchronize with
   // whatever thread ends up running the (blocking) accept loop.
   bool Start();
+
+  // ListenPort returns the port this server is actually listening on.
+  // Only meaningful after Start() has returned true; 0 otherwise. Mainly
+  // useful when constructed with port 0 — the only way to find out what
+  // the OS actually assigned.
+  int ListenPort() const;
 
   // AcceptLoop blocks, accepting connections and spawning one detached
   // thread per client, until Stop() is called from another thread.
@@ -67,6 +80,13 @@ class TcpServer {
   // establishing a happens-before relationship with any other memory —
   // it's just read to pass to a syscall.
   std::atomic<int> listen_fd_{-1};
+
+  // Set once, in Start(), after a successful getsockname() call; read
+  // afterward by ListenPort() — atomic for the same reasons as
+  // listen_fd_ above, even though in practice callers only read it after
+  // Start() has already returned (a natural happens-before), not
+  // concurrently with Start() itself.
+  std::atomic<int> actual_port_{0};
 
   std::atomic<bool> stop_flag_{false};
   std::atomic<int> active_clients_{0};

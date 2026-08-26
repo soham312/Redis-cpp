@@ -19,7 +19,13 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_subdirectory(src)
 
-# Google Test is wired up (via CMake FetchContent) starting in the testing
-# stage, once there's actual code to test — see tests/CMakeLists.txt once
-# that stage adds it. Nothing pulls in an external dependency before
-# there's a reason to.
+# Stage 6: unit tests, via Google Test (pulled in through CMake
+# FetchContent — see tests/CMakeLists.txt for why a pinned version
+# rather than a floating branch). Optional and default-ON: a consumer
+# who only wants the library or the server binary can skip building the
+# whole GTest dependency with -DGOREDIS_BUILD_TESTS=OFF.
+option(GOREDIS_BUILD_TESTS "Build the GoogleTest-based unit test suite" ON)
+if(GOREDIS_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
