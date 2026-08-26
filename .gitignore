@@ -1,0 +1,20 @@
+# CMake build output (out-of-source builds only — never build inside the tree)
+build/
+cmake-build-*/
+
+# Compiler/IDE artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+
+# Runtime data (AOF/snapshot files, once persistence exists)
+data/
+*.aof
+*.rdb
