@@ -41,6 +41,7 @@ bool Store::DeleteIfExpired(const std::string& key) const {
   std::unique_lock lock(mu_);
   const Value* v = data_.Get(key);
   if (v != nullptr && IsExpired(*v)) {
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
     data_.Delete(key);
     return true;
   }
@@ -71,6 +72,7 @@ void Store::SweepExpired() {
   for (const auto& key : expired) {
     const Value* v = data_.Get(key);
     if (v != nullptr && IsExpired(*v)) {
+      used_memory_bytes_ -= EstimateEntryBytes(key, *v);
       data_.Delete(key);
     }
   }
@@ -92,12 +94,86 @@ void Store::SweeperRun() {
   }
 }
 
+std::size_t Store::EstimateEntryBytes(const std::string& key, const Value& v) {
+  std::size_t bytes = key.size() + kPerEntryOverheadBytes;
+  switch (v.type) {
+    case ValueType::kString:
+      bytes += v.str_value.size();
+      break;
+    case ValueType::kList:
+      for (const auto& elem : v.list_value) {
+        bytes += elem.size() + kPerListElementOverheadBytes;
+      }
+      break;
+  }
+  return bytes;
+}
+
+void Store::Touch(const Value& v) const {
+  v.last_accessed_seq.store(access_clock_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+void Store::EvictIfOverBudget() {
+  if (max_memory_bytes_ == 0) {
+    return;
+  }
+  while (used_memory_bytes_ > max_memory_bytes_ && data_.Len() > 0) {
+    auto sample = data_.SampleKeys(kSampleSize);
+    if (sample.empty()) {
+      break;  // shouldn't happen while Len() > 0, but avoids spinning forever if it somehow does.
+    }
+
+    // "Approximate" LRU: rather than maintaining an exact recency-ordered
+    // structure (which would need every read to take the exclusive lock
+    // to update it safely), just evict whichever of a small random
+    // sample has the oldest last_accessed_ms — the same trade-off real
+    // Redis's own maxmemory-samples-based eviction makes.
+    std::size_t victim_index = 0;
+    std::uint64_t oldest = sample[0].second->last_accessed_seq.load(std::memory_order_relaxed);
+    for (std::size_t i = 1; i < sample.size(); ++i) {
+      std::uint64_t accessed = sample[i].second->last_accessed_seq.load(std::memory_order_relaxed);
+      if (accessed < oldest) {
+        oldest = accessed;
+        victim_index = i;
+      }
+    }
+
+    const std::string& victim_key = sample[victim_index].first;
+    used_memory_bytes_ -= EstimateEntryBytes(victim_key, *sample[victim_index].second);
+    data_.Delete(victim_key);
+  }
+}
+
+void Store::SetMaxMemory(std::size_t max_memory_bytes) {
+  std::unique_lock lock(mu_);
+  max_memory_bytes_ = max_memory_bytes;
+  EvictIfOverBudget();
+}
+
+std::size_t Store::UsedMemory() const {
+  std::shared_lock lock(mu_);
+  return used_memory_bytes_;
+}
+
 void Store::Set(const std::string& key, const std::string& value) {
   std::unique_lock lock(mu_);
+
+  const Value* existing = data_.Get(key);
+  std::size_t before = existing != nullptr ? EstimateEntryBytes(key, *existing) : 0;
+
   Value v;
   v.type = ValueType::kString;
   v.str_value = value;
   data_.Set(key, std::move(v));
+
+  const Value* stored = data_.Get(key);
+  used_memory_bytes_ -= before;
+  used_memory_bytes_ += EstimateEntryBytes(key, *stored);
+  Touch(*stored);  // a SET is itself an access — and Value's own
+                    // last_accessed_seq default (0) would otherwise leave
+                    // a never-since-read key looking like the oldest
+                    // thing in the table.
+  EvictIfOverBudget();
 }
 
 Result<std::string> Store::Get(const std::string& key) const {
@@ -111,6 +187,7 @@ Result<std::string> Store::Get(const std::string& key) const {
       if (v->type != ValueType::kString) {
         return Result<std::string>{std::nullopt, StoreError::kWrongType};
       }
+      Touch(*v);
       return Result<std::string>{v->str_value, StoreError::kNone};
     }
   }
@@ -133,12 +210,12 @@ int Store::Del(const std::vector<std::string>& keys) {
     if (v == nullptr) {
       continue;
     }
-    if (IsExpired(*v)) {
-      data_.Delete(key);  // sweep the stale tombstone, but it doesn't count as a logical removal.
-      continue;
-    }
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
+    bool was_expired = IsExpired(*v);
     data_.Delete(key);
-    ++removed;
+    if (!was_expired) {
+      ++removed;
+    }
   }
   return removed;
 }
@@ -188,6 +265,7 @@ std::vector<std::string> Store::Keys() const {
 void Store::FlushAll() {
   std::unique_lock lock(mu_);
   data_.Clear();
+  used_memory_bytes_ = 0;
 }
 
 bool Store::Expire(const std::string& key, long long seconds) {
@@ -198,12 +276,14 @@ bool Store::Expire(const std::string& key, long long seconds) {
     return false;
   }
   if (IsExpired(*v)) {
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
     data_.Delete(key);
     return false;
   }
   if (seconds <= 0) {
     // Matches Redis's own EXPIRE: a non-positive TTL deletes the key
     // immediately rather than setting an expiry time in the past.
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
     data_.Delete(key);
     return true;
   }
@@ -241,6 +321,7 @@ Value* Store::GetOrCreateList(const std::string& key, StoreError* error) {
   if (v != nullptr && IsExpired(*v)) {
     // An expired list is logically gone — drop the stale entry rather
     // than letting a fresh push resurrect old elements alongside it.
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
     data_.Delete(key);
     v = nullptr;
   }
@@ -248,8 +329,11 @@ Value* Store::GetOrCreateList(const std::string& key, StoreError* error) {
     Value fresh;
     fresh.type = ValueType::kList;
     data_.Set(key, std::move(fresh));
-    return data_.Get(key);  // re-fetch: the Value moved into the table is
-                             // what's now owned by the Node, not `fresh`.
+    v = data_.Get(key);  // re-fetch: the Value moved into the table is
+                          // what's now owned by the Node, not `fresh`.
+    used_memory_bytes_ += EstimateEntryBytes(key, *v);  // baseline (empty list) size.
+    Touch(*v);
+    return v;
   }
   if (v->type != ValueType::kList) {
     *error = StoreError::kWrongType;
@@ -267,12 +351,26 @@ Result<int> Store::LPush(const std::string& key, const std::vector<std::string>&
     return Result<int>{std::nullopt, error};
   }
 
+  std::size_t before = EstimateEntryBytes(key, *list);
   // LPUSH pushes each argument in order, so the *last* argument ends up
   // at the head — matching Redis's own LPUSH semantics.
   for (const auto& value : values) {
     list->list_value.insert(list->list_value.begin(), value);
   }
-  return Result<int>{static_cast<int>(list->list_value.size()), StoreError::kNone};
+  used_memory_bytes_ -= before;
+  used_memory_bytes_ += EstimateEntryBytes(key, *list);
+  Touch(*list);
+
+  // Compute the reply *before* running eviction, not after: key is now
+  // the freshest entry in the table, but if it's large enough that
+  // nothing else can be freed to get under budget, key itself can end up
+  // as the eviction victim (an accepted, Redis-like edge case for a
+  // single oversized value) — EvictIfOverBudget would then free the very
+  // Node `list` points into, making any further dereference of `list` a
+  // use-after-free.
+  int result = static_cast<int>(list->list_value.size());
+  EvictIfOverBudget();
+  return Result<int>{result, StoreError::kNone};
 }
 
 Result<int> Store::RPush(const std::string& key, const std::vector<std::string>& values) {
@@ -284,8 +382,18 @@ Result<int> Store::RPush(const std::string& key, const std::vector<std::string>&
     return Result<int>{std::nullopt, error};
   }
 
+  std::size_t before = EstimateEntryBytes(key, *list);
   list->list_value.insert(list->list_value.end(), values.begin(), values.end());
-  return Result<int>{static_cast<int>(list->list_value.size()), StoreError::kNone};
+  used_memory_bytes_ -= before;
+  used_memory_bytes_ += EstimateEntryBytes(key, *list);
+  Touch(*list);
+
+  // See the identical comment in LPush: compute the reply before running
+  // eviction, since EvictIfOverBudget can free the very entry `list`
+  // points into.
+  int result = static_cast<int>(list->list_value.size());
+  EvictIfOverBudget();
+  return Result<int>{result, StoreError::kNone};
 }
 
 Result<int> Store::LLen(const std::string& key) const {
@@ -299,6 +407,7 @@ Result<int> Store::LLen(const std::string& key) const {
       if (v->type != ValueType::kList) {
         return Result<int>{std::nullopt, StoreError::kWrongType};
       }
+      Touch(*v);
       return Result<int>{static_cast<int>(v->list_value.size()), StoreError::kNone};
     }
   }
@@ -319,6 +428,7 @@ Result<std::vector<std::string>> Store::LRange(const std::string& key, int start
     } else if (v->type != ValueType::kList) {
       return Result<std::vector<std::string>>{std::nullopt, StoreError::kWrongType};
     } else {
+      Touch(*v);
       int n = static_cast<int>(v->list_value.size());
       int norm_start = std::max(NormalizeIndex(start, n), 0);
       int norm_stop = std::min(NormalizeIndex(stop, n), n - 1);

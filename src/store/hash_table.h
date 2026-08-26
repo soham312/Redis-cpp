@@ -12,9 +12,11 @@
 // trait/functor for a case this project never actually needs.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -129,6 +131,7 @@ class HashTable {
       if (cur->key == key) {
         *prev_link = std::move(cur->next);
         --num_entries_;
+        MaybeShrink();
         return true;
       }
       prev_link = &cur->next;
@@ -167,6 +170,54 @@ class HashTable {
         fn(cur->key, cur->value);
       }
     }
+  }
+
+  // SampleKeys returns up to `count` pseudo-random (key, value pointer)
+  // entries. Built for callers (Store's approximate-LRU eviction) that
+  // need a cheap, representative subset of the table instead of paying
+  // full O(n) via Keys()/ForEach to look at everything — real eviction
+  // policies (including Redis's own maxmemory-samples) work the same
+  // way, picking a small random sample rather than tracking exact global
+  // order.
+  //
+  // Not a uniform sample of *entries*: it's a uniform sample of *bucket
+  // heads*, so a bucket with a longer collision chain is under-
+  // represented relative to its entry count (only its head node can ever
+  // be picked). With the load factor kept under kMaxLoadFactor, chains
+  // are usually short, so this bias is minor — an accepted approximation
+  // rather than a strict uniform sample, which would need an auxiliary
+  // index this table doesn't otherwise maintain.
+  //
+  // Returned pointers alias table-owned memory with the same lifetime
+  // contract as Get(): valid only while the table isn't mutated.
+  std::vector<std::pair<std::string, const V*>> SampleKeys(std::size_t count) const {
+    std::vector<std::pair<std::string, const V*>> out;
+    if (num_entries_ == 0) {
+      return out;
+    }
+
+    // thread_local rather than a plain static: SampleKeys only reads
+    // buckets_ (no table mutation), so nothing here requires the caller
+    // to hold a lock on this table's behalf — but a single shared
+    // std::mt19937_64 mutated by concurrent callers would itself be a
+    // data race. Giving each thread its own generator sidesteps that
+    // without adding a lock this method doesn't otherwise need.
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<std::size_t> dist(0, buckets_.size() - 1);
+
+    // Bounded retry count: guards against spinning too long if `count`
+    // exceeds num_entries_ or an unlucky run of empty-bucket picks, at
+    // the cost of possibly returning fewer than `count` results.
+    std::size_t attempts = 0;
+    const std::size_t kMaxAttempts = count * 20;
+    while (out.size() < count && attempts < kMaxAttempts) {
+      ++attempts;
+      const Node* head = buckets_[dist(rng)].get();
+      if (head != nullptr) {
+        out.emplace_back(head->key, &head->value);
+      }
+    }
+    return out;
   }
 
   // Clear resets the table to a fresh, empty state. Reallocating the
@@ -234,21 +285,53 @@ class HashTable {
     return static_cast<double>(num_entries_) / static_cast<double>(buckets_.size());
   }
 
-  // Resize doubles bucket capacity and re-links every existing node into
-  // the new bucket vector.
+  // Resize doubles bucket capacity and rehashes every existing node into
+  // it.
   //
   // This is the expensive part of the "amortized O(1) insert" story: any
   // single Set() can trigger an O(n) rehash, but because capacity doubles
   // each time, the total cost of all resizes across n insertions is O(n),
   // so the *average* cost per insertion stays O(1) — the same argument
   // that justifies amortized-O(1) push_back on a std::vector.
+  void Resize() { RehashTo(buckets_.size() * kGrowthMultiplier); }
+
+  // MaybeShrink halves bucket capacity when the load factor has dropped
+  // well below kMaxLoadFactor, down to a floor of kInitialCapacity.
   //
+  // Without this, a table only ever grows: a caller that inserts a lot
+  // and then deletes most of it back out (exactly what Store's eviction
+  // does — evict most of the table down to a memory budget) would be
+  // left with a bucket array sized for the old peak, mostly empty
+  // buckets, forever. That's not just wasted memory — it also directly
+  // hurts SampleKeys' quality (see hash_table.h's doc comment on it):
+  // sampling random bucket heads out of a mostly-empty array wastes
+  // attempts on empty buckets and under-represents the few entries left,
+  // which is precisely the situation eviction cares most about getting
+  // right (deciding between the last few surviving candidates).
+  //
+  // The shrink threshold (kMaxLoadFactor / 4, i.e. triggering well below
+  // where growth would trigger) is deliberate hysteresis: shrinking at
+  // the same boundary growth uses would let a load factor hovering right
+  // at that line thrash between growing and shrinking on alternating
+  // inserts/deletes.
+  void MaybeShrink() {
+    if (buckets_.size() <= kInitialCapacity) {
+      return;
+    }
+    if (LoadFactor() >= kMaxLoadFactor / 4) {
+      return;
+    }
+    std::size_t new_capacity = std::max(buckets_.size() / kGrowthMultiplier, kInitialCapacity);
+    RehashTo(new_capacity);
+  }
+
+  // RehashTo re-links every existing node into a freshly sized bucket
+  // vector, shared by both Resize (growing) and MaybeShrink (shrinking).
   // Nodes are moved, not reallocated: ownership of each already-allocated
   // Node is transferred from the old bucket vector into the new one
-  // (relinking unique_ptrs), so resizing costs relinking pointers, not
+  // (relinking unique_ptrs), so rehashing costs relinking pointers, not
   // copying or reconstructing every stored value.
-  void Resize() {
-    std::size_t new_capacity = buckets_.size() * kGrowthMultiplier;
+  void RehashTo(std::size_t new_capacity) {
     std::vector<std::unique_ptr<Node>> new_buckets(new_capacity);
 
     for (auto& head : buckets_) {

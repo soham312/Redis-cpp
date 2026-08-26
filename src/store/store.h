@@ -5,8 +5,11 @@
 // operation.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -105,6 +108,17 @@ class Store {
   // Matches the return-value convention of Redis's own TTL command.
   long long TTL(const std::string& key) const;
 
+  // SetMaxMemory sets an approximate memory budget in bytes for the
+  // store's contents (see EstimateEntryBytes for what's counted). 0 (the
+  // default) means unlimited, matching Redis's own `maxmemory 0`
+  // convention. Lowering the budget below what's currently used triggers
+  // an immediate eviction pass rather than waiting for the next write.
+  void SetMaxMemory(std::size_t max_memory_bytes);
+
+  // UsedMemory returns the store's current approximate memory usage in
+  // bytes.
+  std::size_t UsedMemory() const;
+
   // LPush prepends values to the list at key (creating it if absent) and
   // returns the resulting length. Values are pushed one at a time in the
   // order given, so the *last* argument ends up at the head — matching
@@ -164,6 +178,33 @@ class Store {
   // every sweep_interval_ until told to stop.
   void SweeperRun();
 
+  // EstimateEntryBytes approximates how much memory one (key, value)
+  // entry occupies: the raw key/payload bytes plus a fixed per-entry
+  // overhead standing in for the HashTable Node object itself and
+  // typical heap-allocator bookkeeping. This is deliberately an
+  // approximation, not exact accounting — an exact count would mean
+  // instrumenting every allocation with a custom allocator, which is far
+  // more machinery than a portfolio store's eviction policy needs. Real
+  // Redis makes the same tradeoff with its own `used_memory` figure.
+  static std::size_t EstimateEntryBytes(const std::string& key, const Value& v);
+
+  // Touch records that v was just read or written, for approximate-LRU
+  // purposes — stamping it with the next tick of access_clock_ (see
+  // below). Safe to call while holding only a shared lock — see the
+  // comment on Value::last_accessed_seq for why. Not static (unlike
+  // IsExpired/EstimateEntryBytes) because it now needs access_clock_,
+  // which belongs to a specific Store instance.
+  void Touch(const Value& v) const;
+
+  // EvictIfOverBudget repeatedly evicts the apparent-least-recently-used
+  // key from a small random sample (see HashTable::SampleKeys) until
+  // used_memory_bytes_ is back at or under max_memory_bytes_, or the
+  // table is empty. A no-op when max_memory_bytes_ is 0 (unlimited).
+  // Caller must already hold mu_ for writing — this is always invoked as
+  // the tail end of a write that could have grown memory usage (Set,
+  // LPush, RPush) or of lowering the budget itself (SetMaxMemory).
+  void EvictIfOverBudget();
+
   // mutable so const methods (Get, Exists, Keys, LLen, LRange, TTL) can
   // take a shared (read) lock — locking itself isn't a logical mutation
   // of the Store from the caller's point of view, but
@@ -179,6 +220,14 @@ class Store {
   mutable std::shared_mutex mu_;
   mutable HashTable<Value> data_;
 
+  // access_clock_ is Store's logical clock for approximate-LRU: Touch()
+  // stamps a Value with the next tick, so ordering ticks is equivalent to
+  // ordering accesses exactly, with no dependency on wall-clock
+  // resolution (see the comment on Value::last_accessed_seq for why that
+  // matters). mutable for the same reason as data_/used_memory_bytes_:
+  // const read paths (Get, LLen, LRange) need to advance it too.
+  mutable std::atomic<std::uint64_t> access_clock_{0};
+
   // Background sweeper thread state. sweeper_mu_/sweeper_cv_ are a
   // dedicated pair used only to sleep-with-early-wakeup between sweeps
   // and to signal shutdown — deliberately separate from mu_ (the data
@@ -188,6 +237,30 @@ class Store {
   std::mutex sweeper_mu_;
   std::condition_variable sweeper_cv_;
   bool stop_sweeper_ = false;
+
+  // kSampleSize mirrors Redis's own default `maxmemory-samples` — how
+  // many random candidates EvictIfOverBudget looks at before evicting the
+  // oldest of them. Larger would make eviction closer to exact LRU at the
+  // cost of more work per eviction; 5 is the same "good enough"
+  // trade-off point Redis itself defaults to.
+  static constexpr std::size_t kSampleSize = 5;
+
+  // Approximate per-entry overhead used by EstimateEntryBytes: a rough
+  // stand-in for HashTable's Node object and heap-allocator bookkeeping
+  // (kPerEntryOverheadBytes), and for one std::string's own object/heap
+  // overhead as a list element (kPerListElementOverheadBytes).
+  static constexpr std::size_t kPerEntryOverheadBytes = 48;
+  static constexpr std::size_t kPerListElementOverheadBytes = 16;
+
+  // max_memory_bytes_ == 0 means unlimited. Both fields are guarded by
+  // mu_ like the rest of Store's mutable state (used_memory_bytes_ isn't
+  // atomic on its own — every read or write of it already happens while
+  // mu_ is held for one reason or another). used_memory_bytes_ is
+  // mutable for the same "logically const" reason as data_: the const
+  // read methods' lazy-expiry path (DeleteIfExpired) adjusts it when it
+  // physically removes a stale entry.
+  std::size_t max_memory_bytes_ = 0;
+  mutable std::size_t used_memory_bytes_ = 0;
 };
 
 }  // namespace goredis
