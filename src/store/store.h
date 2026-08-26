@@ -48,6 +48,27 @@ struct Result {
   bool Ok() const { return error == StoreError::kNone; }
 };
 
+// SnapshotEntry is the atomic unit Store::Snapshot()/LoadSnapshot()
+// exchange with the persistence layer (see persistence/rdb.h) — an
+// in-memory, self-contained copy of one key, deliberately shaped so the
+// persistence layer never needs to touch Store's internals (HashTable,
+// mu_, Value) directly, only this public exchange format.
+//
+// expires_at_wall is a *wall-clock* (system_clock) timestamp, not the
+// steady_clock timestamp Value::expires_at actually uses internally.
+// That conversion is the whole point of this struct existing: a
+// steady_clock time_point has no meaning across a process restart (its
+// epoch is unspecified — see the note on Value::expires_at), so anything
+// meant to survive being written to disk and read back later has to be
+// expressed in wall-clock terms instead. nullopt means no TTL.
+struct SnapshotEntry {
+  std::string key;
+  ValueType type = ValueType::kString;
+  std::string str_value;                  // meaningful iff type == kString.
+  std::vector<std::string> list_value;    // meaningful iff type == kList.
+  std::optional<std::chrono::system_clock::time_point> expires_at_wall;
+};
+
 class Store {
  public:
   // sweep_interval controls how often the background thread actively
@@ -138,6 +159,23 @@ class Store {
   // end" (-1 is the last element). A missing key yields an empty vector,
   // not an error — matching Redis's own LRANGE.
   Result<std::vector<std::string>> LRange(const std::string& key, int start, int stop) const;
+
+  // Snapshot captures every live (non-expired) key in one atomic pass —
+  // a self-contained, in-memory point-in-time copy of the whole dataset,
+  // meant to be handed to the persistence layer (see persistence/rdb.h)
+  // to write out to disk. Store has no file I/O of its own; this is the
+  // full extent of what it knows about persistence.
+  std::vector<SnapshotEntry> Snapshot() const;
+
+  // LoadSnapshot replaces the store's entire contents with entries in one
+  // atomic pass — the inverse of Snapshot(), used to restore what a prior
+  // Snapshot() (via a loaded RDB file) captured. An entry whose
+  // expires_at_wall is already in the past (i.e. it should have expired
+  // during whatever time elapsed since it was captured — most commonly,
+  // however long the process was down) is silently dropped rather than
+  // loaded with a fresh countdown, matching Redis's own RDB-load
+  // behavior.
+  void LoadSnapshot(std::vector<SnapshotEntry> entries);
 
  private:
   using Clock = std::chrono::steady_clock;

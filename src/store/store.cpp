@@ -451,4 +451,65 @@ Result<std::vector<std::string>> Store::LRange(const std::string& key, int start
   return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
 }
 
+std::vector<SnapshotEntry> Store::Snapshot() const {
+  std::vector<SnapshotEntry> out;
+  std::shared_lock lock(mu_);
+  out.reserve(data_.Len());
+
+  auto steady_now = Clock::now();
+  auto wall_now = std::chrono::system_clock::now();
+
+  data_.ForEach([&](const std::string& key, const Value& v) {
+    if (IsExpired(v)) {
+      return;  // logically absent, same as every other read path — don't persist a tombstone.
+    }
+    SnapshotEntry entry;
+    entry.key = key;
+    entry.type = v.type;
+    entry.str_value = v.str_value;
+    entry.list_value = v.list_value;
+    if (v.expires_at.has_value()) {
+      // Anchor the remaining steady_clock duration onto wall_now to get a
+      // timestamp that still means something after a restart — see the
+      // comment on SnapshotEntry::expires_at_wall.
+      auto remaining = *v.expires_at - steady_now;
+      entry.expires_at_wall = wall_now + std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    }
+    out.push_back(std::move(entry));
+  });
+
+  return out;
+}
+
+void Store::LoadSnapshot(std::vector<SnapshotEntry> entries) {
+  std::unique_lock lock(mu_);
+
+  data_.Clear();
+  used_memory_bytes_ = 0;
+
+  auto steady_now = Clock::now();
+  auto wall_now = std::chrono::system_clock::now();
+
+  for (auto& entry : entries) {
+    if (entry.expires_at_wall.has_value() && *entry.expires_at_wall <= wall_now) {
+      continue;  // expired during whatever gap elapsed since it was captured — don't resurrect it.
+    }
+
+    Value v;
+    v.type = entry.type;
+    v.str_value = std::move(entry.str_value);
+    v.list_value = std::move(entry.list_value);
+    if (entry.expires_at_wall.has_value()) {
+      v.expires_at = steady_now + std::chrono::duration_cast<Clock::duration>(*entry.expires_at_wall - wall_now);
+    }
+
+    data_.Set(entry.key, std::move(v));
+    const Value* stored = data_.Get(entry.key);
+    used_memory_bytes_ += EstimateEntryBytes(entry.key, *stored);
+    Touch(*stored);
+  }
+
+  EvictIfOverBudget();  // in case max_memory_bytes_ is already set below what was just loaded.
+}
+
 }  // namespace goredis
