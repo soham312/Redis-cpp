@@ -39,7 +39,14 @@ target_compile_features(goredis_resp PUBLIC cxx_std_17)
 
 # Stage 5 (networking): command dispatch (RESP <-> Store) and the raw
 # POSIX-socket TCP server, thread-per-connection.
+#
+# aof.cpp (AOF persistence) lives in this library, not goredis_persistence:
+# it needs Dispatch() to replay logged commands, and putting a
+# server-layer dependency inside "persistence" would invert this
+# project's layering — see server/aof.h's header comment for the full
+# reasoning.
 add_library(goredis_server STATIC
+  server/aof.cpp
   server/dispatcher.cpp
   server/tcp_server.cpp
 )

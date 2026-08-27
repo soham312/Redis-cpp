@@ -8,6 +8,11 @@
 
 namespace goredis {
 
+// Forward-declared for the same reason as in dispatcher.h: TcpServer only
+// ever holds a pointer to one, passed straight through to each Dispatch()
+// call, so the full definition (server/aof.h) isn't needed in this header.
+class AofWriter;
+
 // TcpServer is a minimal, thread-per-connection TCP server: one
 // dedicated OS thread per connected client. That mirrors the same
 // concurrency philosophy Store itself already uses (plain OS-level
@@ -31,7 +36,13 @@ class TcpServer {
   // processes under ctest and can't coordinate a shared "next free port"
   // counter with each other). See ListenPort() to find out which port
   // was actually assigned.
-  TcpServer(Store& store, int port);
+  //
+  // aof, if non-null, is forwarded to every Dispatch() call so successful
+  // write commands get logged — see server/aof.h. Ownership stays with
+  // the caller (main.cpp): TcpServer only ever reads through this
+  // pointer, never manages its lifetime, since the same AofWriter also
+  // needs to outlive TcpServer for main.cpp's own shutdown sequencing.
+  TcpServer(Store& store, int port, AofWriter* aof = nullptr);
 
   // Start creates, binds, and listens on the server's socket. Must
   // succeed before AcceptLoop() is called. Returns false (after printing
@@ -68,6 +79,7 @@ class TcpServer {
 
   Store& store_;
   int port_;
+  AofWriter* aof_;
 
   // atomic, not a plain int: Start() writes it (main thread), AcceptLoop()
   // reads it every iteration to call accept() (the accept-loop thread),

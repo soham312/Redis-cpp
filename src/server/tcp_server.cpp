@@ -38,7 +38,7 @@ bool SendAll(int fd, const std::string& data) {
 
 }  // namespace
 
-TcpServer::TcpServer(Store& store, int port) : store_(store), port_(port) {}
+TcpServer::TcpServer(Store& store, int port, AofWriter* aof) : store_(store), port_(port), aof_(aof) {}
 
 bool TcpServer::Start() {
   // A local variable throughout setup, not listen_fd_ directly: Start()
@@ -230,7 +230,7 @@ void TcpServer::HandleClient(int client_fd) {
     std::string parse_error;
     CommandParser::Status status;
     while ((status = parser.TryParseCommand(&args, &parse_error)) == CommandParser::Status::kComplete) {
-      RespValue reply = Dispatch(store_, args);
+      RespValue reply = Dispatch(store_, args, aof_);
       if (!SendAll(client_fd, reply.Encode())) {
         return;
       }

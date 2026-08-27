@@ -23,6 +23,7 @@ add_executable(goredis_tests
   store_test.cpp
   store_concurrency_test.cpp
   rdb_test.cpp
+  aof_test.cpp
   resp_value_test.cpp
   command_parser_test.cpp
   dispatcher_test.cpp
