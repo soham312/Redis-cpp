@@ -1,5 +1,9 @@
-# CMake build output (out-of-source builds only — never build inside the tree)
+# CMake build output (out-of-source builds only — never build inside the tree).
+# build-*/ covers the sanitizer-specific build dirs the README's own Testing
+# section has readers create (build-tsan/, build-asan/, ...) — without this,
+# following those instructions leaves an untracked-but-not-ignored directory.
 build/
+build-*/
 cmake-build-*/
 
 # Compiler/IDE artifacts
@@ -14,7 +18,8 @@ compile_commands.json
 .vscode/
 .idea/
 
-# Runtime data (AOF/snapshot files, once persistence exists)
+# Runtime data (AOF/snapshot files)
 data/
 *.aof
 *.rdb
+*.grdb
