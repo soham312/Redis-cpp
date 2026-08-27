@@ -1,0 +1,64 @@
+name: CI
+
+# Runs on every push and PR against main: a plain build+test matrix across
+# both platforms this project claims to support (see README.md — POSIX
+# sockets and pthreads should build unmodified on Linux, and the project
+# is developed against AppleClang on macOS), plus a separate sanitizer job.
+# The sanitizer runs were previously documented as a manual, local-only
+# step (see README.md's Testing section); wiring them into CI means a
+# regression they'd catch can no longer merge unnoticed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j
+
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ASan+UBSan catch memory/UB bugs; TSan catches data races —
+        # they're mutually incompatible in one binary, so two separate
+        # configure/build/test passes, matching README.md's own
+        # documented local workflow for this.
+        sanitizer:
+          - name: address-undefined
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+          - name: thread
+            flags: "-fsanitize=thread -fno-omit-frame-pointer"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (${{ matrix.sanitizer.name }})
+        run: |
+          cmake -S . -B build-${{ matrix.sanitizer.name }} \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DGOREDIS_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer.flags }}"
+
+      - name: Build (${{ matrix.sanitizer.name }})
+        run: cmake --build build-${{ matrix.sanitizer.name }} -j
+
+      - name: Test (${{ matrix.sanitizer.name }})
+        run: ctest --test-dir build-${{ matrix.sanitizer.name }} --output-on-failure -j
