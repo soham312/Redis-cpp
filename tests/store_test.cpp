@@ -6,6 +6,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using goredis::Store;
@@ -290,6 +291,7 @@ TEST(StoreTest, SnapshotAndLoadSnapshotRoundTrip) {
   Store s;
   s.Set("str", "hello");
   s.RPush("list", {"a", "b"});
+  s.HSet("hash", {{"f1", "v1"}, {"f2", "v2"}});
   s.Set("ttlkey", "v");
   s.Expire("ttlkey", 100);
 
@@ -302,6 +304,8 @@ TEST(StoreTest, SnapshotAndLoadSnapshotRoundTrip) {
   EXPECT_EQ(loaded.Exists({"stale"}), 0);
   EXPECT_EQ(*loaded.Get("str").value, "hello");
   EXPECT_EQ(*loaded.LRange("list", 0, -1).value, (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(*loaded.HGet("hash", "f1").value, "v1");
+  EXPECT_EQ(*loaded.HLen("hash").value, 2);
   long long ttl = loaded.TTL("ttlkey");
   EXPECT_GT(ttl, 0);
   EXPECT_LE(ttl, 100);
@@ -336,4 +340,110 @@ TEST(StoreTest, LoadSnapshotDropsEntriesAlreadyExpiredByWallClock) {
   Store loaded;
   loaded.LoadSnapshot(snapshot);
   EXPECT_EQ(loaded.Exists({"shortlived"}), 0);
+}
+
+// ---------------------------------------------------------------------
+// Hash operations
+// ---------------------------------------------------------------------
+
+TEST(StoreTest, HSetReturnsCountOfNewFieldsNotUpdatedOnes) {
+  Store s;
+  auto r1 = s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+  ASSERT_TRUE(r1.Ok());
+  EXPECT_EQ(*r1.value, 2);
+
+  auto r2 = s.HSet("h", {{"f1", "v1-updated"}, {"f3", "v3"}});
+  ASSERT_TRUE(r2.Ok());
+  EXPECT_EQ(*r2.value, 1);  // f1 already existed; only f3 is new.
+}
+
+TEST(StoreTest, HGetOnMissingKeyOrMissingFieldIsNotFound) {
+  Store s;
+  EXPECT_FALSE(s.HGet("nope", "f").value.has_value());
+  s.HSet("h", {{"f1", "v1"}});
+  EXPECT_FALSE(s.HGet("h", "nope").value.has_value());
+  EXPECT_EQ(*s.HGet("h", "f1").value, "v1");
+}
+
+TEST(StoreTest, HGetOnStringKeyIsWrongType) {
+  Store s;
+  s.Set("k", "v");
+  auto r = s.HGet("k", "f");
+  EXPECT_FALSE(r.Ok());
+  EXPECT_EQ(r.error, StoreError::kWrongType);
+}
+
+TEST(StoreTest, HSetOnListKeyIsWrongType) {
+  Store s;
+  s.RPush("k", {"a"});
+  auto r = s.HSet("k", {{"f", "v"}});
+  EXPECT_FALSE(r.Ok());
+}
+
+TEST(StoreTest, HDelRemovesFieldsAndReportsCountActuallyRemoved) {
+  Store s;
+  s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+  auto r = s.HDel("h", {"f1", "nope"});
+  ASSERT_TRUE(r.Ok());
+  EXPECT_EQ(*r.value, 1);
+  EXPECT_EQ(*s.HLen("h").value, 1);
+}
+
+TEST(StoreTest, HDelEmptyingTheHashDeletesTheKeyEntirely) {
+  Store s;
+  s.HSet("h", {{"f1", "v1"}});
+  s.HDel("h", {"f1"});
+  EXPECT_EQ(s.Exists({"h"}), 0);
+}
+
+TEST(StoreTest, HGetAllReturnsEveryFieldValuePair) {
+  Store s;
+  s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+  auto r = s.HGetAll("h");
+  ASSERT_TRUE(r.Ok());
+  ASSERT_EQ(r.value->size(), 2u);
+  std::sort(r.value->begin(), r.value->end());
+  EXPECT_EQ((*r.value)[0], (std::pair<std::string, std::string>{"f1", "v1"}));
+  EXPECT_EQ((*r.value)[1], (std::pair<std::string, std::string>{"f2", "v2"}));
+}
+
+TEST(StoreTest, HGetAllOnMissingKeyIsEmptyNotError) {
+  Store s;
+  auto r = s.HGetAll("nope");
+  ASSERT_TRUE(r.Ok());
+  EXPECT_TRUE(r.value->empty());
+}
+
+TEST(StoreTest, HLenAndHExistsReflectHashState) {
+  Store s;
+  EXPECT_EQ(*s.HLen("nope").value, 0);
+  s.HSet("h", {{"f1", "v1"}});
+  EXPECT_EQ(*s.HLen("h").value, 1);
+  EXPECT_EQ(*s.HExists("h", "f1").value, 1);
+  EXPECT_EQ(*s.HExists("h", "nope").value, 0);
+}
+
+TEST(StoreTest, HKeysAndHValsReturnRespectiveSides) {
+  Store s;
+  s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+  auto keys = s.HKeys("h");
+  auto vals = s.HVals("h");
+  ASSERT_TRUE(keys.Ok());
+  ASSERT_TRUE(vals.Ok());
+  std::sort(keys.value->begin(), keys.value->end());
+  std::sort(vals.value->begin(), vals.value->end());
+  EXPECT_EQ(*keys.value, (std::vector<std::string>{"f1", "f2"}));
+  EXPECT_EQ(*vals.value, (std::vector<std::string>{"v1", "v2"}));
+}
+
+TEST(StoreTest, HashMemoryIsReclaimedOnDeleteAndFlushAll) {
+  Store s;
+  s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+  EXPECT_GT(s.UsedMemory(), 0u);
+  s.Del({"h"});
+  EXPECT_EQ(s.UsedMemory(), 0u);
+
+  s.HSet("h2", {{"f1", "v1"}});
+  s.FlushAll();
+  EXPECT_EQ(s.UsedMemory(), 0u);
 }

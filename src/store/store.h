@@ -66,6 +66,7 @@ struct SnapshotEntry {
   ValueType type = ValueType::kString;
   std::string str_value;                  // meaningful iff type == kString.
   std::vector<std::string> list_value;    // meaningful iff type == kList.
+  std::vector<std::pair<std::string, std::string>> hash_value;  // meaningful iff type == kHash.
   std::optional<std::chrono::system_clock::time_point> expires_at_wall;
 };
 
@@ -160,6 +161,40 @@ class Store {
   // not an error — matching Redis's own LRANGE.
   Result<std::vector<std::string>> LRange(const std::string& key, int start, int stop) const;
 
+  // HSet sets each (field, value) pair on the hash at key (creating it if
+  // absent) and returns how many of them were *new* fields — matching
+  // Redis's own HSET, which counts additions, not updates, in its
+  // integer reply.
+  Result<int> HSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields);
+
+  // HGet returns the value of one field on the hash at key. A missing key
+  // or a missing field are indistinguishable to the caller (both yield an
+  // empty Result), same as Redis's own HGET.
+  Result<std::string> HGet(const std::string& key, const std::string& field) const;
+
+  // HDel removes each of fields from the hash at key and returns how many
+  // were actually present. If this empties the hash entirely, the key
+  // itself is deleted — matching Redis's own behavior of never leaving a
+  // zero-field hash sitting in the keyspace.
+  Result<int> HDel(const std::string& key, const std::vector<std::string>& fields);
+
+  // HGetAll returns every (field, value) pair in the hash at key. A
+  // missing key yields an empty vector, not an error.
+  Result<std::vector<std::pair<std::string, std::string>>> HGetAll(const std::string& key) const;
+
+  // HLen returns the number of fields in the hash at key (0 if the key
+  // doesn't exist).
+  Result<int> HLen(const std::string& key) const;
+
+  // HExists reports whether field exists in the hash at key, as 0/1 —
+  // matching Redis's own HEXISTS integer reply convention.
+  Result<int> HExists(const std::string& key, const std::string& field) const;
+
+  // HKeys/HVals return just the field names, or just the values, of the
+  // hash at key.
+  Result<std::vector<std::string>> HKeys(const std::string& key) const;
+  Result<std::vector<std::string>> HVals(const std::string& key) const;
+
   // Snapshot captures every live (non-expired) key in one atomic pass —
   // a self-contained, in-memory point-in-time copy of the whole dataset,
   // meant to be handed to the persistence layer (see persistence/rdb.h)
@@ -186,6 +221,11 @@ class Store {
   // Returns nullptr with *error set to kWrongType if key holds a string.
   // Caller must hold mu_ for writing.
   Value* GetOrCreateList(const std::string& key, StoreError* error);
+
+  // GetOrCreateHash is GetOrCreateList's mirror for the kHash type — see
+  // its comment for the shared reasoning (expired-entry handling,
+  // WRONGTYPE detection, caller locking requirement).
+  Value* GetOrCreateHash(const std::string& key, StoreError* error);
 
   // IsExpired reports whether v's TTL (if any) has passed. Doesn't itself
   // touch the table — see DeleteIfExpired for the half that does.
@@ -289,6 +329,10 @@ class Store {
   // overhead as a list element (kPerListElementOverheadBytes).
   static constexpr std::size_t kPerEntryOverheadBytes = 48;
   static constexpr std::size_t kPerListElementOverheadBytes = 16;
+  // Same conservative per-element estimate as kPerListElementOverheadBytes,
+  // named separately so a hash field's accounting reads as what it is
+  // rather than borrowing a list-specific-sounding constant.
+  static constexpr std::size_t kPerHashFieldOverheadBytes = 16;
 
   // max_memory_bytes_ == 0 means unlimited. Both fields are guarded by
   // mu_ like the rest of Store's mutable state (used_memory_bytes_ isn't

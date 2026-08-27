@@ -133,3 +133,19 @@ TEST(RdbTest, EmptyStoreRoundTripsToEmptyAndClearsTarget) {
   ASSERT_TRUE(LoadRdb(loaded, path));
   EXPECT_TRUE(loaded.Keys().empty());
 }
+
+TEST(RdbTest, RoundTripPreservesHashFields) {
+  std::string path = TestFilePath("hash_roundtrip");
+  {
+    Store s;
+    s.HSet("h", {{"f1", "v1"}, {"f2", "v2"}});
+    s.HSet("empty_after_save", {{"f", "v"}});  // exercises a non-trivial field count on the wire
+    ASSERT_TRUE(SaveRdb(s, path));
+  }
+  Store loaded;
+  ASSERT_TRUE(LoadRdb(loaded, path));
+  EXPECT_EQ(*loaded.HLen("h").value, 2);
+  EXPECT_EQ(*loaded.HGet("h", "f1").value, "v1");
+  EXPECT_EQ(*loaded.HGet("h", "f2").value, "v2");
+  EXPECT_EQ(*loaded.HGet("empty_after_save", "f").value, "v");
+}

@@ -105,6 +105,11 @@ std::size_t Store::EstimateEntryBytes(const std::string& key, const Value& v) {
         bytes += elem.size() + kPerListElementOverheadBytes;
       }
       break;
+    case ValueType::kHash:
+      v.hash_value.ForEach([&](const std::string& field, const std::string& val) {
+        bytes += field.size() + val.size() + kPerHashFieldOverheadBytes;
+      });
+      break;
   }
   return bytes;
 }
@@ -342,6 +347,31 @@ Value* Store::GetOrCreateList(const std::string& key, StoreError* error) {
   return v;
 }
 
+Value* Store::GetOrCreateHash(const std::string& key, StoreError* error) {
+  *error = StoreError::kNone;
+
+  Value* v = data_.Get(key);
+  if (v != nullptr && IsExpired(*v)) {
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
+    data_.Delete(key);
+    v = nullptr;
+  }
+  if (v == nullptr) {
+    Value fresh;
+    fresh.type = ValueType::kHash;
+    data_.Set(key, std::move(fresh));
+    v = data_.Get(key);  // re-fetch: see the identical note in GetOrCreateList.
+    used_memory_bytes_ += EstimateEntryBytes(key, *v);
+    Touch(*v);
+    return v;
+  }
+  if (v->type != ValueType::kHash) {
+    *error = StoreError::kWrongType;
+    return nullptr;
+  }
+  return v;
+}
+
 Result<int> Store::LPush(const std::string& key, const std::vector<std::string>& values) {
   std::unique_lock lock(mu_);
 
@@ -451,6 +481,212 @@ Result<std::vector<std::string>> Store::LRange(const std::string& key, int start
   return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
 }
 
+Result<int> Store::HSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields) {
+  std::unique_lock lock(mu_);
+
+  StoreError error = StoreError::kNone;
+  Value* hash = GetOrCreateHash(key, &error);
+  if (hash == nullptr) {
+    return Result<int>{std::nullopt, error};
+  }
+
+  std::size_t before = EstimateEntryBytes(key, *hash);
+  int added = 0;
+  for (const auto& [field, value] : fields) {
+    // HashTable::Set returns true when it updated an existing entry, so
+    // a new field is exactly the false case.
+    if (!hash->hash_value.Set(field, value)) {
+      ++added;
+    }
+  }
+  used_memory_bytes_ -= before;
+  used_memory_bytes_ += EstimateEntryBytes(key, *hash);
+  Touch(*hash);
+
+  // Same reasoning as LPush/RPush: compute the reply before running
+  // eviction, since hash (a raw Value*) could itself be the entry
+  // EvictIfOverBudget frees.
+  EvictIfOverBudget();
+  return Result<int>{added, StoreError::kNone};
+}
+
+Result<std::string> Store::HGet(const std::string& key, const std::string& field) const {
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<std::string>{};
+    }
+    if (!IsExpired(*v)) {
+      if (v->type != ValueType::kHash) {
+        return Result<std::string>{std::nullopt, StoreError::kWrongType};
+      }
+      Touch(*v);
+      const std::string* val = v->hash_value.Get(field);
+      if (val == nullptr) {
+        return Result<std::string>{};
+      }
+      return Result<std::string>{*val, StoreError::kNone};
+    }
+  }
+  DeleteIfExpired(key);
+  return Result<std::string>{};
+}
+
+Result<int> Store::HDel(const std::string& key, const std::vector<std::string>& fields) {
+  std::unique_lock lock(mu_);
+
+  Value* v = data_.Get(key);
+  if (v == nullptr) {
+    return Result<int>{0, StoreError::kNone};
+  }
+  if (IsExpired(*v)) {
+    used_memory_bytes_ -= EstimateEntryBytes(key, *v);
+    data_.Delete(key);
+    return Result<int>{0, StoreError::kNone};
+  }
+  if (v->type != ValueType::kHash) {
+    return Result<int>{std::nullopt, StoreError::kWrongType};
+  }
+
+  std::size_t before = EstimateEntryBytes(key, *v);
+  int removed = 0;
+  for (const auto& field : fields) {
+    if (v->hash_value.Delete(field)) {
+      ++removed;
+    }
+  }
+
+  // Matching Redis: a hash that's been emptied out by HDEL doesn't linger
+  // in the keyspace as a zero-field entry — it's deleted outright, the
+  // same way this store never leaves an empty-but-present key around.
+  if (v->hash_value.Len() == 0) {
+    used_memory_bytes_ -= before;
+    data_.Delete(key);
+  } else {
+    used_memory_bytes_ -= before;
+    used_memory_bytes_ += EstimateEntryBytes(key, *v);
+    Touch(*v);
+  }
+  return Result<int>{removed, StoreError::kNone};
+}
+
+Result<std::vector<std::pair<std::string, std::string>>> Store::HGetAll(const std::string& key) const {
+  bool found_expired = false;
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<std::vector<std::pair<std::string, std::string>>>{
+          std::vector<std::pair<std::string, std::string>>{}, StoreError::kNone};
+    }
+    if (IsExpired(*v)) {
+      found_expired = true;
+    } else if (v->type != ValueType::kHash) {
+      return Result<std::vector<std::pair<std::string, std::string>>>{std::nullopt, StoreError::kWrongType};
+    } else {
+      Touch(*v);
+      std::vector<std::pair<std::string, std::string>> out;
+      out.reserve(v->hash_value.Len());
+      v->hash_value.ForEach(
+          [&](const std::string& field, const std::string& val) { out.emplace_back(field, val); });
+      return Result<std::vector<std::pair<std::string, std::string>>>{std::move(out), StoreError::kNone};
+    }
+  }
+  if (found_expired) {
+    DeleteIfExpired(key);
+  }
+  return Result<std::vector<std::pair<std::string, std::string>>>{std::vector<std::pair<std::string, std::string>>{},
+                                                                    StoreError::kNone};
+}
+
+Result<int> Store::HLen(const std::string& key) const {
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<int>{0, StoreError::kNone};
+    }
+    if (!IsExpired(*v)) {
+      if (v->type != ValueType::kHash) {
+        return Result<int>{std::nullopt, StoreError::kWrongType};
+      }
+      Touch(*v);
+      return Result<int>{static_cast<int>(v->hash_value.Len()), StoreError::kNone};
+    }
+  }
+  DeleteIfExpired(key);
+  return Result<int>{0, StoreError::kNone};
+}
+
+Result<int> Store::HExists(const std::string& key, const std::string& field) const {
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<int>{0, StoreError::kNone};
+    }
+    if (!IsExpired(*v)) {
+      if (v->type != ValueType::kHash) {
+        return Result<int>{std::nullopt, StoreError::kWrongType};
+      }
+      Touch(*v);
+      return Result<int>{v->hash_value.Get(field) != nullptr ? 1 : 0, StoreError::kNone};
+    }
+  }
+  DeleteIfExpired(key);
+  return Result<int>{0, StoreError::kNone};
+}
+
+Result<std::vector<std::string>> Store::HKeys(const std::string& key) const {
+  bool found_expired = false;
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
+    }
+    if (IsExpired(*v)) {
+      found_expired = true;
+    } else if (v->type != ValueType::kHash) {
+      return Result<std::vector<std::string>>{std::nullopt, StoreError::kWrongType};
+    } else {
+      Touch(*v);
+      return Result<std::vector<std::string>>{v->hash_value.Keys(), StoreError::kNone};
+    }
+  }
+  if (found_expired) {
+    DeleteIfExpired(key);
+  }
+  return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
+}
+
+Result<std::vector<std::string>> Store::HVals(const std::string& key) const {
+  bool found_expired = false;
+  {
+    std::shared_lock lock(mu_);
+    const Value* v = data_.Get(key);
+    if (v == nullptr) {
+      return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
+    }
+    if (IsExpired(*v)) {
+      found_expired = true;
+    } else if (v->type != ValueType::kHash) {
+      return Result<std::vector<std::string>>{std::nullopt, StoreError::kWrongType};
+    } else {
+      Touch(*v);
+      std::vector<std::string> out;
+      out.reserve(v->hash_value.Len());
+      v->hash_value.ForEach([&](const std::string& /*field*/, const std::string& val) { out.push_back(val); });
+      return Result<std::vector<std::string>>{std::move(out), StoreError::kNone};
+    }
+  }
+  if (found_expired) {
+    DeleteIfExpired(key);
+  }
+  return Result<std::vector<std::string>>{std::vector<std::string>{}, StoreError::kNone};
+}
+
 std::vector<SnapshotEntry> Store::Snapshot() const {
   std::vector<SnapshotEntry> out;
   std::shared_lock lock(mu_);
@@ -468,6 +704,11 @@ std::vector<SnapshotEntry> Store::Snapshot() const {
     entry.type = v.type;
     entry.str_value = v.str_value;
     entry.list_value = v.list_value;
+    if (v.type == ValueType::kHash) {
+      entry.hash_value.reserve(v.hash_value.Len());
+      v.hash_value.ForEach(
+          [&](const std::string& field, const std::string& val) { entry.hash_value.emplace_back(field, val); });
+    }
     if (v.expires_at.has_value()) {
       // Anchor the remaining steady_clock duration onto wall_now to get a
       // timestamp that still means something after a restart — see the
@@ -499,6 +740,11 @@ void Store::LoadSnapshot(std::vector<SnapshotEntry> entries) {
     v.type = entry.type;
     v.str_value = std::move(entry.str_value);
     v.list_value = std::move(entry.list_value);
+    if (entry.type == ValueType::kHash) {
+      for (auto& field_value : entry.hash_value) {
+        v.hash_value.Set(field_value.first, std::move(field_value.second));
+      }
+    }
     if (entry.expires_at_wall.has_value()) {
       v.expires_at = steady_now + std::chrono::duration_cast<Clock::duration>(*entry.expires_at_wall - wall_now);
     }

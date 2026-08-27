@@ -12,9 +12,17 @@ namespace goredis {
 namespace {
 
 constexpr char kMagic[4] = {'G', 'R', 'D', 'B'};
-constexpr std::uint32_t kFormatVersion = 1;
+// Bumped from 1 to 2 when the kHash type was added: a version-1 file
+// never contains a kTypeHash byte, so it still loads fine under version 2
+// (the format is a strict superset), but the reverse isn't safe — a
+// version-2 file containing a hash could silently misparse under an old
+// binary that's never heard of kTypeHash. Rather than let that happen
+// quietly, the version check below rejects a mismatch outright, same as
+// it always has for any other kind of incompatible file.
+constexpr std::uint32_t kFormatVersion = 2;
 constexpr std::uint8_t kTypeString = 0;
 constexpr std::uint8_t kTypeList = 1;
+constexpr std::uint8_t kTypeHash = 2;
 
 // ByteWriter builds a serialized image in memory, one primitive at a
 // time. All multi-byte integers are written explicitly little-endian
@@ -163,7 +171,13 @@ bool SaveRdb(const Store& store, const std::string& path) {
 
   for (const auto& entry : entries) {
     w.WriteString(entry.key);
-    w.WriteU8(entry.type == ValueType::kList ? kTypeList : kTypeString);
+    std::uint8_t type_byte = kTypeString;
+    if (entry.type == ValueType::kList) {
+      type_byte = kTypeList;
+    } else if (entry.type == ValueType::kHash) {
+      type_byte = kTypeHash;
+    }
+    w.WriteU8(type_byte);
 
     w.WriteU8(entry.expires_at_wall.has_value() ? 1 : 0);
     if (entry.expires_at_wall.has_value()) {
@@ -176,6 +190,12 @@ bool SaveRdb(const Store& store, const std::string& path) {
       w.WriteU32(static_cast<std::uint32_t>(entry.list_value.size()));
       for (const auto& elem : entry.list_value) {
         w.WriteString(elem);
+      }
+    } else if (entry.type == ValueType::kHash) {
+      w.WriteU32(static_cast<std::uint32_t>(entry.hash_value.size()));
+      for (const auto& field_value : entry.hash_value) {
+        w.WriteString(field_value.first);
+        w.WriteString(field_value.second);
       }
     } else {
       w.WriteString(entry.str_value);
@@ -266,7 +286,13 @@ bool LoadRdb(Store& store, const std::string& path) {
     if (!r.ReadU8(&type_byte)) {
       return false;
     }
-    entry.type = (type_byte == kTypeList) ? ValueType::kList : ValueType::kString;
+    if (type_byte == kTypeList) {
+      entry.type = ValueType::kList;
+    } else if (type_byte == kTypeHash) {
+      entry.type = ValueType::kHash;
+    } else {
+      entry.type = ValueType::kString;
+    }
 
     std::uint8_t has_ttl;
     if (!r.ReadU8(&has_ttl)) {
@@ -302,6 +328,19 @@ bool LoadRdb(Store& store, const std::string& path) {
           return false;
         }
         entry.list_value.push_back(std::move(elem));
+      }
+    } else if (entry.type == ValueType::kHash) {
+      std::uint32_t field_count;
+      if (!r.ReadU32(&field_count)) {
+        return false;
+      }
+      entry.hash_value.reserve(field_count);
+      for (std::uint32_t j = 0; j < field_count; ++j) {
+        std::string field, value;
+        if (!r.ReadString(&field) || !r.ReadString(&value)) {
+          return false;
+        }
+        entry.hash_value.emplace_back(std::move(field), std::move(value));
       }
     } else {
       if (!r.ReadString(&entry.str_value)) {

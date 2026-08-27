@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "hash_table.h"
+
 namespace goredis {
 
 // ValueType identifies which member of Value is meaningful. A tagged
@@ -20,6 +22,7 @@ namespace goredis {
 enum class ValueType {
   kString,
   kList,
+  kHash,
 };
 
 // Value is not independently heap-allocated or wrapped in a smart
@@ -32,6 +35,19 @@ struct Value {
   ValueType type = ValueType::kString;
   std::string str_value;
   std::vector<std::string> list_value;
+
+  // hash_value backs the kHash type — reusing HashTable<std::string>
+  // (the same class Store's own top-level table is built from, see
+  // store/hash_table.h) rather than std::unordered_map: a Hash type is,
+  // structurally, exactly the "string key -> string value" problem
+  // HashTable already solves, so field storage gets the project's own
+  // hand-rolled implementation for free instead of reaching for the
+  // standard container this project otherwise avoids. Meaningful iff
+  // type == kHash; unconditionally default-constructed (a small, fixed
+  // kInitialCapacity bucket vector) the same way str_value/list_value
+  // are always present regardless of which one a given Value actually
+  // uses.
+  HashTable<std::string> hash_value;
 
   // expires_at is nullopt for a key with no TTL. When set, the key is
   // logically gone once steady_clock::now() passes it, even before
@@ -107,6 +123,7 @@ struct Value {
       : type(other.type),
         str_value(std::move(other.str_value)),
         list_value(std::move(other.list_value)),
+        hash_value(std::move(other.hash_value)),
         expires_at(other.expires_at),
         last_accessed_seq(other.last_accessed_seq.load(std::memory_order_relaxed)) {}
 
@@ -114,6 +131,7 @@ struct Value {
     type = other.type;
     str_value = std::move(other.str_value);
     list_value = std::move(other.list_value);
+    hash_value = std::move(other.hash_value);
     expires_at = other.expires_at;
     last_accessed_seq.store(other.last_accessed_seq.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return *this;
