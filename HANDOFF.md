@@ -39,10 +39,11 @@ Test count grew from 110 → **142**, all passing under plain, ASan/UBSan, and T
 builds (verified this session, including two full repeat runs to rule out
 test-file-hygiene flakiness — see the AOF section below).
 
-**Not yet committed** — everything in stages 9–11 above, plus the original
-`.gitignore` diff (a `*.grdb` entry) from before this session, are sitting as
-uncommitted working-tree changes. Nothing has been pushed. Review and commit is the
-natural next step once you're happy with it.
+**Committed and pushed.** Stages 9–11 above landed as 4 commits on `main` (split by
+concern: store-layer Hash type; command-layer Hash/glob/AOF wiring — these two are
+entangled in `dispatcher.cpp` and couldn't be split further; CI+Docker; docs), and
+`origin/main` is confirmed up to date with local `main`. Working tree is clean —
+nothing outstanding to commit.
 
 ## Architecture
 
